@@ -12,6 +12,7 @@
 #include "esp_adc/adc_cali_scheme.h"
 #include "esp_log.h"
 #include "driver/ledc.h"
+#include "freertos/queue.h"
 
 static bool example_adc_calibration_init(adc_unit_t unit, adc_channel_t channel, adc_atten_t atten, adc_cali_handle_t *out_handle);
 
@@ -19,6 +20,7 @@ static bool example_adc_calibration_init(adc_unit_t unit, adc_channel_t channel,
 #define HIGH_LIMIT 506 // 2-ish
 adc_cali_handle_t adc2_cali_chan9_handle = NULL;
 int knob_position; // 0....2000
+QueueHandle_t motorQueue;
 
 void knobMeasure(void *arg)
 {
@@ -71,6 +73,11 @@ void knobMeasure(void *arg)
 
         ESP_ERROR_CHECK(adc_oneshot_read(adc2_handle, ADC_CHANNEL_9, &knob_position));
 
+        xQueueSend(motorQueue, &knob_position, portMAX_DELAY);
+        // >> motorControl unblocks, has higher priority, run its update of the motor, block again
+        // >> when bloccks again due to xqueuereceive, knob taks is probably the next highest priority and resumes again
+
+        //Directly updating motor here is an efficient solution
         vTaskDelay(10 / portTICK_PERIOD_MS);
     }
 }
@@ -99,16 +106,22 @@ void motorControl(void *arg)
     ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
 
     int duty_value = 0;
+    int queueValue;
 
     while (1)
     {
-        // range 0-4096
-        duty_value = knob_position * (HIGH_LIMIT - LOW_LIMIT) / 4096 + LOW_LIMIT;
-        ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty_value));
-        // Update duty to apply the new value
-        ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0));
 
-        vTaskDelay(10 / portTICK_PERIOD_MS);
+        if (xQueueReceive(motorQueue, &queueValue, portMAX_DELAY) == pdPASS) 
+        {
+            // range 0-4096
+            duty_value = queueValue * (HIGH_LIMIT - LOW_LIMIT) / 4096 + LOW_LIMIT;
+            ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty_value));
+            // Update duty to apply the new value
+            ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0));
+            
+            //No need for delay because we're blocking
+            //vTaskDelay(10 / portTICK_PERIOD_MS);
+        }
     }
 }
 
@@ -225,6 +238,8 @@ void app_main(void)
 {
 
     startupPrint();
+
+    motorQueue = xQueueCreate(10, sizeof(int));
 
     TaskHandle_t knobtask = NULL;
     xTaskCreate(knobMeasure, "KNOB_TASK", 2048, NULL, 10, &knobtask);
