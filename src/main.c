@@ -13,14 +13,20 @@
 #include "esp_log.h"
 #include "driver/ledc.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 
 static bool example_adc_calibration_init(adc_unit_t unit, adc_channel_t channel, adc_atten_t atten, adc_cali_handle_t *out_handle);
 
 #define LOW_LIMIT 95   // 1ms
 #define HIGH_LIMIT 506 // 2-ish
+
 adc_cali_handle_t adc2_cali_chan9_handle = NULL;
 int knob_position; // 0....2000
+
 QueueHandle_t motorQueue;
+QueueHandle_t triggerQueue;
+
+SemaphoreHandle_t motorSemaphore;
 
 void knobMeasure(void *arg)
 {
@@ -70,15 +76,16 @@ void knobMeasure(void *arg)
 
     while (1)
     {
+        xSemaphoreTake(motorSemaphore, portMAX_DELAY);
 
         ESP_ERROR_CHECK(adc_oneshot_read(adc2_handle, ADC_CHANNEL_9, &knob_position));
 
         xQueueSend(motorQueue, &knob_position, portMAX_DELAY);
         // >> motorControl unblocks, has higher priority, run its update of the motor, block again
         // >> when bloccks again due to xqueuereceive, knob taks is probably the next highest priority and resumes again
+        xSemaphoreGive(motorSemaphore);
 
-        //Directly updating motor here is an efficient solution
-        vTaskDelay(10 / portTICK_PERIOD_MS);
+        vTaskDelay(15/portTICK_PERIOD_MS);
     }
 }
 
@@ -111,16 +118,16 @@ void motorControl(void *arg)
     while (1)
     {
 
-        if (xQueueReceive(motorQueue, &queueValue, portMAX_DELAY) == pdPASS) 
+        if (xQueueReceive(motorQueue, &queueValue, portMAX_DELAY) == pdPASS)
         {
             // range 0-4096
             duty_value = queueValue * (HIGH_LIMIT - LOW_LIMIT) / 4096 + LOW_LIMIT;
             ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty_value));
             // Update duty to apply the new value
             ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0));
-            
-            //No need for delay because we're blocking
-            //vTaskDelay(10 / portTICK_PERIOD_MS);
+
+            // No need for delay because we're blocking
+            // vTaskDelay(10 / portTICK_PERIOD_MS);
         }
     }
 }
@@ -205,6 +212,39 @@ void ledDim(void *arg)
     }
 }
 
+// Put this function into ram memory instead of flash
+static void IRAM_ATTR buttonInterrupt(void *arg)
+{
+    int triggerPosition = (int) arg;
+    //Has built in fair warning
+    xQueueSendFromISR(triggerQueue, &triggerPosition, NULL);
+}
+
+void triggerTask(void *arg){
+
+    int queueValue;
+    int triggerPosition = 0;
+
+    while (1)
+    {
+
+        if (xQueueReceive(triggerQueue, &queueValue, portMAX_DELAY) == pdPASS)
+        {
+            printf("Interrupt %d\n", (int)arg); //not interrupt friendly
+
+            xSemaphoreTake(motorSemaphore,portMAX_DELAY); 
+            //You should make sure that your receive the sempahore properly with an if statement
+
+            xQueueSend(motorQueue, &triggerPosition, portMAX_DELAY);
+            vTaskDelay(1000/portTICK_PERIOD_MS);
+
+            xSemaphoreGive(motorSemaphore);
+            
+        }
+    }
+
+}
+
 void startupPrint()
 {
     /* Print chip information */
@@ -234,12 +274,49 @@ void startupPrint()
     printf("Minimum free heap size: %" PRIu32 " bytes\n", esp_get_minimum_free_heap_size());
 }
 
+void configureInput()
+{
+
+    // zero-initialize the config structure.
+    gpio_config_t io_conf = {};
+
+    // If voltage is zero and changes to high
+    // It's a rising/positive edge
+    io_conf.intr_type = GPIO_INTR_POSEDGE;
+    // Falling edge/negative edge is when it is high
+    // and then goes low
+    // When sustained high or low that is duration
+    // As oppposed to instances
+
+    // set as input mode
+    io_conf.mode = GPIO_MODE_INPUT;
+
+    // Boot Button GPIO
+    io_conf.pin_bit_mask = (1ULL << GPIO_NUM_0);
+    // disable pull-down mode
+    io_conf.pull_down_en = 0;
+    // enable ull-up mode
+    // because when you press the button its grounded
+    io_conf.pull_up_en = 1;
+
+    // configure GPIO with the given settings
+    gpio_config(&io_conf);
+}
+
 void app_main(void)
 {
 
     startupPrint();
 
+    motorSemaphore = xSemaphoreCreateMutex();
+    configureInput();
+
+    // Enables interrupts
+    gpio_install_isr_service(0);
+    gpio_isr_handler_add(GPIO_NUM_0, buttonInterrupt, (void *)GPIO_NUM_0);
+
     motorQueue = xQueueCreate(10, sizeof(int));
+    triggerQueue = xQueueCreate(10, sizeof(int));
 
     TaskHandle_t knobtask = NULL;
     xTaskCreate(knobMeasure, "KNOB_TASK", 2048, NULL, 10, &knobtask);
@@ -252,6 +329,9 @@ void app_main(void)
 
     TaskHandle_t dimtask = NULL;
     xTaskCreate(ledDim, "DIM_TASK", 2048, NULL, 5, &dimtask);
+
+    TaskHandle_t triggertask = NULL;
+    xTaskCreate(triggerTask, "TRIGGER_TASK", 2048, NULL, 24, &triggertask);
 
     int voltage;
 
